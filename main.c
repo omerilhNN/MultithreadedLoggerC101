@@ -5,82 +5,126 @@
 #include <string.h>
 
 #define NUM_THREADS 10
-#define NUM_LOG_ENTRIES 100000
-#define BATCH_SIZE 1000
+#define MAX_LOG_ENTRIES 1000000
+#define BUFFER_SIZE 8192 // Must be a power of 2
 #define LOG_FILE_PATH "logs\\log.txt"
-
-typedef struct LogNode {
-    char* message;
-    struct LogNode* next;
-} LogNode;
+#define BATCH_SIZE 1000
 
 typedef struct {
-    LogNode* head;
-    LogNode* tail;
-    LONG size;
-    CRITICAL_SECTION lock;
-} AtomicQueue;
+    char* buffer[BUFFER_SIZE];
+    volatile LONG write_pos;
+    volatile LONG read_pos;
+} RingBuffer;
 
-void enqueue(AtomicQueue* queue, char* message) {
-    LogNode* newNode = (LogNode*)malloc(sizeof(LogNode));
-    newNode->message = message;
-    newNode->next = NULL;
+void produce_log_message(RingBuffer* ring_buffer, int threadNumber, FILETIME startTime);
+DWORD WINAPI log_producer(LPVOID arg);
+DWORD WINAPI log_writer(LPVOID arg);
 
-    EnterCriticalSection(&queue->lock);
-    LogNode* prevTail = queue->tail;
-    if (prevTail != NULL) {
-        prevTail->next = newNode;
-    }
-    else {
-        queue->head = newNode;
-    }
-    queue->tail = newNode;
-    InterlockedIncrement(&queue->size);
-    LeaveCriticalSection(&queue->lock);
-}
-
-char* dequeue(AtomicQueue* queue) {
-    EnterCriticalSection(&queue->lock);
-    LogNode* head = queue->head;
-    if (head == NULL) {
-        LeaveCriticalSection(&queue->lock);
-        return NULL;
-    }
-    queue->head = head->next;
-    if (queue->head == NULL) {
-        queue->tail = NULL;
-    }
-    char* message = head->message;
-    free(head);
-    InterlockedDecrement(&queue->size);
-    LeaveCriticalSection(&queue->lock);
-    return message;
-}
-
-int is_queue_empty(AtomicQueue* queue) {
-    return InterlockedCompareExchange(&queue->size, 0, 0) == 0;
-}
-AtomicQueue logQueue = { NULL, NULL, 0 };
+RingBuffer ring_buffer;
 HANDLE loggingThreads[NUM_THREADS];
 HANDLE logWriterThread;
 volatile LONG isRunning = 1;
-CRITICAL_SECTION fileMutex;
+volatile LONG logCounter = 0;
+HANDLE fileMutex;
+FILETIME startTime;
+
+void GetElapsedTime(FILETIME startTime, double* elapsedSeconds) {
+    FILETIME currentTime;
+    ULARGE_INTEGER start, end;
+    GetSystemTimeAsFileTime(&currentTime);
+    start.LowPart = startTime.dwLowDateTime;
+    start.HighPart = startTime.dwHighDateTime;
+    end.LowPart = currentTime.dwLowDateTime;
+    end.HighPart = currentTime.dwHighDateTime;
+    *elapsedSeconds = (double)(end.QuadPart - start.QuadPart) / 10000000.0;
+}
+
+int main() {
+    FILETIME endTime;
+    double elapsedSeconds;
+
+    //Retrieves the current system date and time. As UTC.
+    GetSystemTimeAsFileTime(&startTime);
+
+    memset(&ring_buffer, 0, sizeof(RingBuffer));
+    
+    if (CreateDirectory("logs", NULL) != 0) {
+        printf("Error Creating directory: %d\n",GetLastError());
+    }
+    
+    fileMutex = CreateMutex(NULL, FALSE, NULL); //initial ownership is false
+
+    logWriterThread = CreateThread(NULL, 0, log_writer, NULL, 0, NULL);
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        int* threadNumber = (int*)malloc(sizeof(int));
+        *threadNumber = i;
+        loggingThreads[i] = CreateThread(NULL, 0, log_producer, threadNumber, 0, NULL);
+    }
+
+    WaitForMultipleObjects(NUM_THREADS, loggingThreads, TRUE, INFINITE);
+
+    //Atomic olarak bu iki deðerin deðiþimini saðlar (Ayný anda birden fazla threadin eriþimini engeller)
+    InterlockedExchange(&isRunning, 0);
+    WaitForSingleObject(logWriterThread, INFINITE);
+
+    CloseHandle(fileMutex);
+
+    GetSystemTimeAsFileTime(&endTime);
+
+    GetElapsedTime(startTime, &elapsedSeconds);
+
+    printf("Total execution time: %.4f seconds\n", elapsedSeconds);
+
+    return 0;
+}
+
+void produce_log_message(RingBuffer* ring_buffer, int threadNumber, FILETIME startTime) {
+
+    char logMessage[256];
+    while (InterlockedIncrement(&logCounter) <= MAX_LOG_ENTRIES) {
+        double elapsedSeconds;
+        GetElapsedTime(startTime, &elapsedSeconds);
+
+        time_t now = time(NULL);
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &now);
+
+        snprintf(logMessage, sizeof(logMessage), "%.6f | Thread %d | Logging message %d", elapsedSeconds, threadNumber, logCounter);
+
+        logMessage[sizeof(logMessage) - 1] = '\0';
+
+        LONG write_pos;
+        while (1) {
+            write_pos = ring_buffer->write_pos;
+            LONG next_write_pos = (write_pos + 1) & (BUFFER_SIZE - 1);
+            if (next_write_pos == ring_buffer->read_pos) {
+                // Buffer is full, wait until space is available
+                Sleep(1);
+            }
+            else {
+                if (InterlockedCompareExchange(&ring_buffer->write_pos, next_write_pos, write_pos) == write_pos) {
+                    break;
+                }
+            }
+        }
+
+        // Allocate memory for the log message
+        char* logMessageCopy = _strdup(logMessage);
+        if (logMessageCopy == NULL) {
+            perror("Failed to allocate memory for log message");
+            exit(EXIT_FAILURE);
+        }
+        //Eðer  = logMessage yaparsak -> logMessage local bir deðiþken olduðundan ve ring_buffer'ýn bufferýný onun adresine eþitlediðimizden dolayý function scope'undan çýkýldýðýnda 
+        //geçersiz bir deðer olur o yüzden _strdup kullanýlýr ve memory allocation saðlanýr ve o addresteki deðere eþitlemesi yapýlýr.
+        ring_buffer->buffer[write_pos] = logMessageCopy;
+    }
+}
 
 DWORD WINAPI log_producer(LPVOID arg) {
     int threadNumber = *(int*)arg;
     free(arg);
-
-    for (int i = 0; i < NUM_LOG_ENTRIES; i++) {
-        char* logMessage = (char*)malloc(256);
-        time_t now = time(NULL);
-        struct tm timeinfo;
-        localtime_s(&timeinfo, &now);
-        strftime(logMessage, 256, "%Y-%m-%dT%H:%M:%S", &timeinfo);
-        snprintf(logMessage + strlen(logMessage), 256 - strlen(logMessage), ".%03d Thread %d: %s", (int)(now % 1000), threadNumber, logMessage);
-
-        enqueue(&logQueue, logMessage);
-    }
-
+    produce_log_message(&ring_buffer, threadNumber, startTime);
     return 0;
 }
 
@@ -94,57 +138,41 @@ DWORD WINAPI log_writer(LPVOID arg) {
     char* batch[BATCH_SIZE];
     int batchCount = 0;
 
-    while (InterlockedCompareExchange(&isRunning, 1, 1) || !is_queue_empty(&logQueue)) {
-        while (batchCount < BATCH_SIZE && (batch[batchCount] = dequeue(&logQueue)) != NULL) {
-            batchCount++;
+    //InterlockedCompareExchange: isRunning deðerini 3.Parametre (Comperand) ile karþýlaþtýr deðerler eþit ise 2.parametredeki deðeri isRunning'e atamasýný yap.
+    while (InterlockedCompareExchange(&isRunning, 1, 1) || (ring_buffer.read_pos != ring_buffer.write_pos)) {
+        while (batchCount < BATCH_SIZE && (ring_buffer.read_pos != ring_buffer.write_pos)) {
+            LONG read_pos = ring_buffer.read_pos;
+            if (InterlockedCompareExchange(&ring_buffer.read_pos, (read_pos + 1) & (BUFFER_SIZE - 1), read_pos) == read_pos) {
+                batch[batchCount++] = ring_buffer.buffer[read_pos];
+            }
         }
 
         if (batchCount > 0) {
-            EnterCriticalSection(&fileMutex);
+            WaitForSingleObject(fileMutex, INFINITE);
             for (int i = 0; i < batchCount; i++) {
                 fprintf(logFile, "%s\n", batch[i]);
                 free(batch[i]);
             }
-            LeaveCriticalSection(&fileMutex);
+            ReleaseMutex(fileMutex);
             batchCount = 0;
         }
         else {
-            Sleep(10); 
+            Sleep(10); // Sleep for 10ms to reduce CPU usage
         }
     }
 
-    while ((batch[batchCount] = dequeue(&logQueue)) != NULL) {
-        EnterCriticalSection(&fileMutex);
-        fprintf(logFile, "%s\n", batch[batchCount]);
-        free(batch[batchCount]);
-        LeaveCriticalSection(&fileMutex);
+    // Process any remaining messages
+    while (ring_buffer.read_pos != ring_buffer.write_pos) {
+        LONG read_pos = ring_buffer.read_pos;
+        if (InterlockedCompareExchange(&ring_buffer.read_pos, (read_pos + 1) & (BUFFER_SIZE - 1), read_pos) == read_pos) {
+            char* logMessage = ring_buffer.buffer[read_pos];
+            WaitForSingleObject(fileMutex, INFINITE);
+            fprintf(logFile, "%s\n", logMessage);
+            ReleaseMutex(fileMutex);
+            free(logMessage);
+        }
     }
 
     fclose(logFile);
-    return 0;
-}
-
-int main() {
-    CreateDirectory("logs", NULL);
-
-    InitializeCriticalSection(&fileMutex);
-    InitializeCriticalSection(&logQueue.lock);
-
-    logWriterThread = CreateThread(NULL, 0, log_writer, NULL, 0, NULL);
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        int* threadNumber = (int*)malloc(sizeof(int));
-        *threadNumber = i;
-        loggingThreads[i] = CreateThread(NULL, 0, log_producer, threadNumber, 0, NULL);
-    }
-
-    WaitForMultipleObjects(NUM_THREADS, loggingThreads, TRUE, INFINITE);
-
-    InterlockedExchange(&isRunning, 0);
-    WaitForSingleObject(logWriterThread, INFINITE);
-
-    DeleteCriticalSection(&fileMutex);
-    DeleteCriticalSection(&logQueue.lock);
-
     return 0;
 }
