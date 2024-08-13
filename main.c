@@ -1,13 +1,13 @@
 #include "logger.h"
 
 int main() {
-    double elapsedSeconds;
+    LoggerContext logger;
 
-    initialize_logger(MAX_LOG_ENTRIES);
+    initialize_logger(&logger, MAX_LOG_ENTRIES);
 
-    start_logging();
+    start_logging(&logger);
 
-    stop_logging();
+    stop_logging(&logger);
 
     return 0;
 }
