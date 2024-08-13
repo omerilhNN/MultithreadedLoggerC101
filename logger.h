@@ -16,7 +16,6 @@ typedef struct LogNode {
     char message[LOG_MESSAGE_SIZE];
     struct LogNode* next;
 } LogNode;
-
 // BlockingQueue structure
 typedef struct {
     LogNode* head;
@@ -28,21 +27,21 @@ typedef struct {
     int capacity;
 } BlockingQueue;
 
-// Global variables declaration
-extern BlockingQueue logQueue;
-extern int isRunning;
-extern int logCounter;
-extern FILETIME startTime;
-extern HANDLE logWriterThread;
+// LoggerContext structure
+typedef struct {
+    BlockingQueue logQueue;
+    int isRunning;
+    int logCounter;
+    FILETIME startTime;
+    HANDLE logWriterThread;
+    HANDLE loggingThreads[NUM_THREADS];
+} LoggerContext;
 
 // Function declarations
-void initialize_queue(BlockingQueue* queue, int capacity);
-void destroy_queue(BlockingQueue* queue);
-void enqueue(BlockingQueue* queue, const char* message);
-LogNode* dequeue(BlockingQueue* queue);
-void produce_log_message(BlockingQueue* queue, int threadNumber, FILETIME startTime);
-DWORD WINAPI log_producer(LPVOID arg);
-DWORD WINAPI log_writer(LPVOID arg);
+void initialize_logger(int capacity);
+void start_logging();
+void stop_logging();
 void GetElapsedTime(FILETIME startTime, double* elapsedSeconds);
+
 
 #endif // LOGGER_H

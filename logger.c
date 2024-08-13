@@ -3,13 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-BlockingQueue logQueue;
-int isRunning = 1;
-int logCounter = 0;
-FILETIME startTime;
-HANDLE logWriterThread;
+// Global logger context
+static LoggerContext logger;
 
-// Implementations of the functions
 void initialize_queue(BlockingQueue* queue, int capacity) {
     queue->head = NULL;
     queue->tail = NULL;
@@ -74,16 +70,16 @@ void produce_log_message(BlockingQueue* queue, int threadNumber, FILETIME startT
     double elapsedSeconds;
 
     while (1) {
-        EnterCriticalSection(&logQueue.cs);
-        if (logCounter >= MAX_LOG_ENTRIES) {
-            LeaveCriticalSection(&logQueue.cs);
+        EnterCriticalSection(&queue->cs);
+        if (logger.logCounter >= MAX_LOG_ENTRIES) {
+            LeaveCriticalSection(&queue->cs);
             break;
         }
-        logCounter++;
-        LeaveCriticalSection(&logQueue.cs);
+        logger.logCounter++;
+        LeaveCriticalSection(&queue->cs);
 
         GetElapsedTime(startTime, &elapsedSeconds);
-        snprintf(logMessage, sizeof(logMessage), "%.6f | Thread %d | Logging message %d", elapsedSeconds, threadNumber, logCounter);
+        snprintf(logMessage, sizeof(logMessage), "%.6f | Thread %d | Logging message %d", elapsedSeconds, threadNumber, logger.logCounter);
         logMessage[sizeof(logMessage) - 1] = '\0';
 
         enqueue(queue, logMessage);
@@ -93,7 +89,7 @@ void produce_log_message(BlockingQueue* queue, int threadNumber, FILETIME startT
 DWORD WINAPI log_producer(LPVOID arg) {
     int threadNumber = *(int*)arg;
     free(arg);
-    produce_log_message(&logQueue, threadNumber, startTime);
+    produce_log_message(&logger.logQueue, threadNumber, logger.startTime);
     return 0;
 }
 
@@ -104,16 +100,16 @@ DWORD WINAPI log_writer(LPVOID arg) {
     size_t bufferIndex = 0;
 
     while (1) {
-        EnterCriticalSection(&logQueue.cs);
-        while (logQueue.count == 0 && isRunning) {
-            SleepConditionVariableCS(&logQueue.notEmpty, &logQueue.cs, INFINITE);
+        EnterCriticalSection(&logger.logQueue.cs);
+        while (logger.logQueue.count == 0 && logger.isRunning) {
+            SleepConditionVariableCS(&logger.logQueue.notEmpty, &logger.logQueue.cs, INFINITE);
         }
-        if (!isRunning && logQueue.count == 0) {
-            LeaveCriticalSection(&logQueue.cs);
+        if (!logger.isRunning && logger.logQueue.count == 0) {
+            LeaveCriticalSection(&logger.logQueue.cs);
             break;
         }
-        LogNode* node = dequeue(&logQueue);
-        LeaveCriticalSection(&logQueue.cs);
+        LogNode* node = dequeue(&logger.logQueue);
+        LeaveCriticalSection(&logger.logQueue.cs);
 
         if (node) {
             size_t messageLength = strlen(node->message);
@@ -144,4 +140,49 @@ void GetElapsedTime(FILETIME startTime, double* elapsedSeconds) {
     end.LowPart = currentTime.dwLowDateTime;
     end.HighPart = currentTime.dwHighDateTime;
     *elapsedSeconds = (double)(end.QuadPart - start.QuadPart) / 10000000.0;
+}
+
+void initialize_logger(int capacity) {
+    logger.isRunning = 1;
+    logger.logCounter = 0;
+    GetSystemTimeAsFileTime(&logger.startTime);
+    initialize_queue(&logger.logQueue, capacity);
+}
+
+void start_logging() {
+    FILE* logFile = fopen(LOG_FILE_PATH, "a");
+    if (logFile == NULL) {
+        perror("Failed to open log file");
+        exit(EXIT_FAILURE);
+    }
+
+    logger.logWriterThread = CreateThread(NULL, 0, log_writer, logFile, 0, NULL);
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        int* threadNumber = (int*)malloc(sizeof(int));
+        if (threadNumber == NULL) {
+            perror("Failed to allocate memory for thread number");
+            exit(EXIT_FAILURE);
+        }
+        *threadNumber = i;
+        logger.loggingThreads[i] = CreateThread(NULL, 0, log_producer, threadNumber, 0, NULL);
+        if (logger.loggingThreads[i] == NULL) {
+            perror("Failed to create logging thread");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void stop_logging() {
+    WaitForMultipleObjects(NUM_THREADS, logger.loggingThreads, TRUE, INFINITE);
+
+    EnterCriticalSection(&logger.logQueue.cs);
+    logger.isRunning = 0;
+    WakeConditionVariable(&logger.logQueue.notEmpty);
+    LeaveCriticalSection(&logger.logQueue.cs);
+
+    WaitForSingleObject(logger.logWriterThread, INFINITE);
+    fclose(logger.logWriterThread);
+
+    destroy_queue(&logger.logQueue);
 }
